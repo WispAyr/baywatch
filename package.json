@@ -1,7 +1,7 @@
 {
-  "name": "zone-occupancy",
+  "name": "baywatch",
   "version": "1.0.0",
-  "description": "Zone Occupancy Counter - counts objects in polygon-defined zones",
+  "description": "Baywatch - Parking Bay Monitor - counts objects in polygon-defined zones",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

@@ -32,6 +32,24 @@ db.exec(`
     timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (zone_id) REFERENCES zones(id)
   );
+
+  CREATE TABLE IF NOT EXISTS parking_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id TEXT NOT NULL,
+    zone_name TEXT,
+    camera_id TEXT,
+    event_type TEXT NOT NULL,
+    count_before INTEGER,
+    count_after INTEGER,
+    duration_seconds INTEGER,
+    entry_time TEXT,
+    exit_time TEXT,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (zone_id) REFERENCES zones(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_parking_events_timestamp ON parking_events(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_parking_events_zone ON parking_events(zone_id);
 `);
 
 export interface Zone {
@@ -138,6 +156,10 @@ export function updateZone(id: string, input: Partial<ZoneInput>): Zone | null {
 }
 
 export function deleteZone(id: string): boolean {
+  // Delete related records first to avoid FK constraints
+  db.prepare('DELETE FROM occupancy_log WHERE zone_id = ?').run(id);
+  db.prepare('DELETE FROM parking_events WHERE zone_id = ?').run(id);
+  
   const stmt = db.prepare('DELETE FROM zones WHERE id = ?');
   const result = stmt.run(id);
   return result.changes > 0;
@@ -173,6 +195,192 @@ export function getRecentOccupancy(zoneId: string, limit = 100): any[] {
     LIMIT ?
   `);
   return stmt.all(zoneId, limit) as any[];
+}
+
+// ============ PARKING EVENTS ============
+
+export interface ParkingEvent {
+  id: number;
+  zone_id: string;
+  zone_name: string;
+  camera_id: string;
+  event_type: 'entry' | 'exit' | 'occupancy_change';
+  count_before: number;
+  count_after: number;
+  duration_seconds: number | null;
+  entry_time: string | null;
+  exit_time: string | null;
+  timestamp: string;
+}
+
+// Track active sessions per zone (for duration calculation)
+const activeZoneSessions: Map<string, { entryTime: Date; count: number }> = new Map();
+
+export function logParkingEvent(
+  zoneId: string,
+  zoneName: string,
+  cameraId: string,
+  countBefore: number,
+  countAfter: number
+): ParkingEvent | null {
+  const now = new Date();
+  const nowStr = now.toISOString();
+  
+  // Determine event type
+  let eventType: 'entry' | 'exit' | 'occupancy_change';
+  let durationSeconds: number | null = null;
+  let entryTime: string | null = null;
+  let exitTime: string | null = null;
+  
+  if (countBefore === 0 && countAfter > 0) {
+    // Entry event - vehicle(s) entered empty zone
+    eventType = 'entry';
+    entryTime = nowStr;
+    activeZoneSessions.set(zoneId, { entryTime: now, count: countAfter });
+  } else if (countBefore > 0 && countAfter === 0) {
+    // Exit event - zone became empty
+    eventType = 'exit';
+    exitTime = nowStr;
+    
+    // Calculate duration from entry
+    const session = activeZoneSessions.get(zoneId);
+    if (session) {
+      durationSeconds = Math.round((now.getTime() - session.entryTime.getTime()) / 1000);
+      entryTime = session.entryTime.toISOString();
+      activeZoneSessions.delete(zoneId);
+    }
+  } else if (countBefore !== countAfter) {
+    // Occupancy change (not entry/exit, just count changed)
+    eventType = 'occupancy_change';
+  } else {
+    // No change - don't log
+    return null;
+  }
+  
+  const stmt = db.prepare(`
+    INSERT INTO parking_events (zone_id, zone_name, camera_id, event_type, count_before, count_after, duration_seconds, entry_time, exit_time)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  
+  const result = stmt.run(zoneId, zoneName, cameraId, eventType, countBefore, countAfter, durationSeconds, entryTime, exitTime);
+  
+  return {
+    id: result.lastInsertRowid as number,
+    zone_id: zoneId,
+    zone_name: zoneName,
+    camera_id: cameraId,
+    event_type: eventType,
+    count_before: countBefore,
+    count_after: countAfter,
+    duration_seconds: durationSeconds,
+    entry_time: entryTime,
+    exit_time: exitTime,
+    timestamp: nowStr
+  };
+}
+
+export function getParkingEvents(options: {
+  limit?: number;
+  offset?: number;
+  zoneId?: string;
+  cameraId?: string;
+  eventType?: string;
+  since?: string;
+  until?: string;
+} = {}): { events: ParkingEvent[]; total: number } {
+  const { limit = 100, offset = 0, zoneId, cameraId, eventType, since, until } = options;
+  
+  let whereClause = '1=1';
+  const params: any[] = [];
+  
+  if (zoneId) {
+    whereClause += ' AND zone_id = ?';
+    params.push(zoneId);
+  }
+  if (cameraId) {
+    whereClause += ' AND camera_id = ?';
+    params.push(cameraId);
+  }
+  if (eventType) {
+    whereClause += ' AND event_type = ?';
+    params.push(eventType);
+  }
+  if (since) {
+    whereClause += ' AND timestamp >= ?';
+    params.push(since);
+  }
+  if (until) {
+    whereClause += ' AND timestamp <= ?';
+    params.push(until);
+  }
+  
+  // Get total count
+  const countStmt = db.prepare(`SELECT COUNT(*) as total FROM parking_events WHERE ${whereClause}`);
+  const totalRow = countStmt.get(...params) as { total: number };
+  
+  // Get events
+  const stmt = db.prepare(`
+    SELECT * FROM parking_events 
+    WHERE ${whereClause}
+    ORDER BY timestamp DESC 
+    LIMIT ? OFFSET ?
+  `);
+  
+  const events = stmt.all(...params, limit, offset) as ParkingEvent[];
+  
+  return { events, total: totalRow.total };
+}
+
+export function getParkingStats(since?: string): {
+  totalEntries: number;
+  totalExits: number;
+  avgDurationSeconds: number;
+  currentOccupied: number;
+  byZone: { zone_id: string; zone_name: string; entries: number; exits: number; avgDuration: number }[];
+} {
+  const sinceClause = since ? `AND timestamp >= '${since}'` : '';
+  
+  const totalStmt = db.prepare(`
+    SELECT 
+      SUM(CASE WHEN event_type = 'entry' THEN 1 ELSE 0 END) as entries,
+      SUM(CASE WHEN event_type = 'exit' THEN 1 ELSE 0 END) as exits,
+      AVG(CASE WHEN duration_seconds IS NOT NULL THEN duration_seconds END) as avg_duration
+    FROM parking_events
+    WHERE 1=1 ${sinceClause}
+  `);
+  const totals = totalStmt.get() as any;
+  
+  const byZoneStmt = db.prepare(`
+    SELECT 
+      zone_id,
+      zone_name,
+      SUM(CASE WHEN event_type = 'entry' THEN 1 ELSE 0 END) as entries,
+      SUM(CASE WHEN event_type = 'exit' THEN 1 ELSE 0 END) as exits,
+      AVG(CASE WHEN duration_seconds IS NOT NULL THEN duration_seconds END) as avg_duration
+    FROM parking_events
+    WHERE 1=1 ${sinceClause}
+    GROUP BY zone_id, zone_name
+    ORDER BY entries DESC
+  `);
+  const byZone = byZoneStmt.all() as any[];
+  
+  // Count currently occupied zones
+  const occupiedStmt = db.prepare(`SELECT COUNT(*) as count FROM (SELECT zone_id FROM parking_events WHERE event_type = 'entry' GROUP BY zone_id HAVING MAX(id) IN (SELECT MAX(id) FROM parking_events WHERE event_type = 'entry' GROUP BY zone_id))`);
+  const occupied = activeZoneSessions.size;
+  
+  return {
+    totalEntries: totals.entries || 0,
+    totalExits: totals.exits || 0,
+    avgDurationSeconds: Math.round(totals.avg_duration || 0),
+    currentOccupied: occupied,
+    byZone: byZone.map(z => ({
+      zone_id: z.zone_id,
+      zone_name: z.zone_name,
+      entries: z.entries || 0,
+      exits: z.exits || 0,
+      avgDuration: Math.round(z.avg_duration || 0)
+    }))
+  };
 }
 
 export default db;

@@ -15,8 +15,8 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Serve dashboard static files
-const dashboardPath = path.join(__dirname, '..', 'dashboard');
+// Serve dashboard static files (built version)
+const dashboardPath = path.join(__dirname, '..', 'dashboard', 'dist');
 app.use('/ui', express.static(dashboardPath));
 // Also serve assets from root for Vite's default paths
 app.use('/assets', express.static(path.join(dashboardPath, 'assets')));
@@ -134,6 +134,147 @@ app.post('/detection/mode', async (req: Request, res: Response) => {
     broadcast({ type: 'mode_changed', mode });
     
     res.json({ success: true, mode });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============ LPR ENDPOINTS ============
+
+const HAILO_OPS_URL = process.env.HAILO_OPS_URL || 'http://localhost:3000';
+const GO2RTC_URL = process.env.GO2RTC_URL || 'http://localhost:1984';
+
+// Scan camera for plates
+app.post('/lpr/scan', async (req: Request, res: Response) => {
+  try {
+    const { camera_id, zone_id } = req.body;
+    
+    if (!camera_id) {
+      res.status(400).json({ error: 'camera_id required' });
+      return;
+    }
+    
+    // Fetch frame from go2rtc
+    const frameResponse = await fetch(`${GO2RTC_URL}/api/frame.jpeg?src=${camera_id}`);
+    if (!frameResponse.ok) {
+      res.status(400).json({ error: 'Failed to fetch camera frame' });
+      return;
+    }
+    const frameBuffer = Buffer.from(await frameResponse.arrayBuffer());
+    
+    // Send to halio-ops LPR
+    const formData = new FormData();
+    formData.append('file', new Blob([frameBuffer]), 'frame.jpg');
+    
+    const lprResponse = await fetch(`${HAILO_OPS_URL}/analyze/lpr`, {
+      method: 'POST',
+      body: formData
+    });
+    
+    if (!lprResponse.ok) {
+      res.status(500).json({ error: 'LPR service error' });
+      return;
+    }
+    
+    const lprResult = await lprResponse.json() as {
+      success: boolean;
+      plates_detected?: number;
+      plates?: { text: string; confidence: number; bbox?: any }[];
+      text?: string;
+      confidence?: number;
+    };
+    
+    // If plates found, record them
+    const plates: any[] = [];
+    if (lprResult.success && lprResult.plates_detected && lprResult.plates_detected > 0) {
+      for (const plate of (lprResult.plates || [])) {
+        const zone = zone_id ? db.getZone(zone_id) : null;
+        const plateId = db.recordPlate({
+          plate_text: plate.text,
+          confidence: plate.confidence,
+          zone_id: zone_id,
+          zone_name: zone?.name,
+          camera_id: camera_id,
+        });
+        plates.push({ id: plateId, ...plate, zone_name: zone?.name });
+      }
+    } else if (lprResult.success && lprResult.text) {
+      // Single plate format
+      const zone = zone_id ? db.getZone(zone_id) : null;
+      const plateId = db.recordPlate({
+        plate_text: lprResult.text,
+        confidence: lprResult.confidence || 0,
+        zone_id: zone_id,
+        zone_name: zone?.name,
+        camera_id: camera_id,
+      });
+      plates.push({ id: plateId, text: lprResult.text, confidence: lprResult.confidence, zone_name: zone?.name });
+    }
+    
+    // Broadcast plate detection
+    if (plates.length > 0) {
+      broadcast({ type: 'plate_detected', plates, camera_id, zone_id });
+    }
+    
+    res.json({
+      success: true,
+      plates_detected: plates.length,
+      plates,
+      camera_id,
+      zone_id
+    });
+  } catch (error: any) {
+    console.error('LPR scan error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get active (parked) plates
+app.get('/lpr/active', (_req: Request, res: Response) => {
+  try {
+    const plates = db.getActivePlates();
+    res.json({ plates, count: plates.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get recent plates
+app.get('/lpr/recent', (req: Request, res: Response) => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 50;
+    const plates = db.getRecentPlates(limit);
+    res.json({ plates, count: plates.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get plate history
+app.get('/lpr/plate/:plateText', (req: Request, res: Response) => {
+  try {
+    const plateText = req.params.plateText as string;
+    const history = db.getPlateHistory(plateText);
+    const current = db.getPlateByText(plateText);
+    res.json({ plate_text: plateText, current, history });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark plate as exited
+app.post('/lpr/exit', (req: Request, res: Response) => {
+  try {
+    const { plate_text, zone_id } = req.body;
+    if (!plate_text) {
+      res.status(400).json({ error: 'plate_text required' });
+      return;
+    }
+    const success = db.markPlateExited(plate_text, zone_id);
+    if (success) {
+      broadcast({ type: 'plate_exited', plate_text, zone_id });
+    }
+    res.json({ success, plate_text, zone_id });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

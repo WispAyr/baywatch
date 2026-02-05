@@ -50,6 +50,25 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_parking_events_timestamp ON parking_events(timestamp);
   CREATE INDEX IF NOT EXISTS idx_parking_events_zone ON parking_events(zone_id);
+
+  CREATE TABLE IF NOT EXISTS plates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plate_text TEXT NOT NULL,
+    confidence REAL,
+    zone_id TEXT,
+    zone_name TEXT,
+    camera_id TEXT,
+    vehicle_type TEXT,
+    entered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    exited_at TEXT,
+    status TEXT DEFAULT 'parked',
+    thumbnail BLOB,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_plates_text ON plates(plate_text);
+  CREATE INDEX IF NOT EXISTS idx_plates_status ON plates(status);
+  CREATE INDEX IF NOT EXISTS idx_plates_zone ON plates(zone_id);
 `);
 
 export interface Zone {
@@ -381,6 +400,95 @@ export function getParkingStats(since?: string): {
       avgDuration: Math.round(z.avg_duration || 0)
     }))
   };
+}
+
+// ============ PLATE FUNCTIONS ============
+
+export interface PlateRecord {
+  id: number;
+  plate_text: string;
+  confidence: number;
+  zone_id: string | null;
+  zone_name: string | null;
+  camera_id: string | null;
+  vehicle_type: string | null;
+  entered_at: string;
+  exited_at: string | null;
+  status: 'parked' | 'exited' | 'unknown';
+  created_at: string;
+}
+
+export function recordPlate(data: {
+  plate_text: string;
+  confidence?: number;
+  zone_id?: string;
+  zone_name?: string;
+  camera_id?: string;
+  vehicle_type?: string;
+  thumbnail?: Buffer;
+}): number {
+  const stmt = db.prepare(`
+    INSERT INTO plates (plate_text, confidence, zone_id, zone_name, camera_id, vehicle_type, thumbnail)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const result = stmt.run(
+    data.plate_text,
+    data.confidence || 0,
+    data.zone_id || null,
+    data.zone_name || null,
+    data.camera_id || null,
+    data.vehicle_type || null,
+    data.thumbnail || null
+  );
+  return result.lastInsertRowid as number;
+}
+
+export function markPlateExited(plateText: string, zoneId?: string): boolean {
+  let stmt;
+  if (zoneId) {
+    stmt = db.prepare(`
+      UPDATE plates SET status = 'exited', exited_at = datetime('now')
+      WHERE plate_text = ? AND zone_id = ? AND status = 'parked'
+    `);
+    const result = stmt.run(plateText, zoneId);
+    return result.changes > 0;
+  } else {
+    stmt = db.prepare(`
+      UPDATE plates SET status = 'exited', exited_at = datetime('now')
+      WHERE plate_text = ? AND status = 'parked'
+    `);
+    const result = stmt.run(plateText);
+    return result.changes > 0;
+  }
+}
+
+export function getPlateByText(plateText: string): PlateRecord | null {
+  const stmt = db.prepare('SELECT * FROM plates WHERE plate_text = ? ORDER BY created_at DESC LIMIT 1');
+  return stmt.get(plateText) as PlateRecord | null;
+}
+
+export function getActivePlates(): PlateRecord[] {
+  const stmt = db.prepare('SELECT * FROM plates WHERE status = ? ORDER BY entered_at DESC');
+  return stmt.all('parked') as PlateRecord[];
+}
+
+export function getRecentPlates(limit: number = 50): PlateRecord[] {
+  const stmt = db.prepare('SELECT * FROM plates ORDER BY created_at DESC LIMIT ?');
+  return stmt.all(limit) as PlateRecord[];
+}
+
+export function getPlateHistory(plateText: string, limit: number = 20): PlateRecord[] {
+  const stmt = db.prepare('SELECT * FROM plates WHERE plate_text = ? ORDER BY created_at DESC LIMIT ?');
+  return stmt.all(plateText, limit) as PlateRecord[];
+}
+
+export function getPlatesByZone(zoneId: string, status?: string): PlateRecord[] {
+  if (status) {
+    const stmt = db.prepare('SELECT * FROM plates WHERE zone_id = ? AND status = ? ORDER BY entered_at DESC');
+    return stmt.all(zoneId, status) as PlateRecord[];
+  }
+  const stmt = db.prepare('SELECT * FROM plates WHERE zone_id = ? ORDER BY entered_at DESC LIMIT 100');
+  return stmt.all(zoneId) as PlateRecord[];
 }
 
 export default db;
